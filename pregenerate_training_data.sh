@@ -9,7 +9,7 @@ python pregenerate_training_data.py \
 --bert_model $bert_model \
 --do_lower_case \
 --epochs_to_generate 3 \
---max_seq_len 128 \
+--max_seq_len 64 \
 --short_seq_prob 0.1 \
 --masked_lm_prob 0.15 \
 --max_predictions_per_seq 20

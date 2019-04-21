@@ -10,4 +10,5 @@ python finetune_on_pregenerated.py \
 --do_lower_case \
 --epochs 3 \
 --train_batch_size 32 \
---gradient_accumulation_steps 4
+--gradient_accumulation_steps 2 
+#--DEBUG

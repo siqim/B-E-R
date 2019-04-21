@@ -13,13 +13,10 @@ import torch
 import pickle
 import numpy as np
 from tqdm import tqdm
-from nltk import word_tokenize, sent_tokenize
-from joblib import Parallel, delayed
-import multiprocessing as mp
-from itertools import repeat
+from nltk import sent_tokenize
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 
-from pytorch_pretrained_bert import BertTokenizer, BertForSequenceClassification
+from pytorch_pretrained_bert import BertTokenizer
 
 
 def save_model_optimizer(model, optimizer, epoch, global_batch_counter_train, global_batch_counter_test, dir):

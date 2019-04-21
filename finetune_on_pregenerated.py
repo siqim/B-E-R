@@ -15,6 +15,7 @@ from tqdm import tqdm
 from pytorch_pretrained_bert.modeling import BertForPreTraining
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
+from tensorboardX import SummaryWriter
 
 InputFeatures = namedtuple("InputFeatures", "input_ids input_mask segment_ids lm_label_ids is_next")
 
@@ -166,6 +167,10 @@ def main():
                         type=int,
                         default=42,
                         help="random seed for initialization")
+
+    parser.add_argument("--DEBUG", action="store_true")
+
+
     args = parser.parse_args()
 
     assert args.pregenerated_data.is_dir(), \
@@ -276,10 +281,12 @@ def main():
                              t_total=num_train_optimization_steps)
 
     global_step = 0
+    global_batch_counter_train = 0
     logging.info("***** Running training *****")
     logging.info(f"  Num examples = {total_train_examples}")
     logging.info("  Batch size = %d", args.train_batch_size)
     logging.info("  Num steps = %d", num_train_optimization_steps)
+    writer = SummaryWriter(str(args.output_dir))
     model.train()
     for epoch in range(args.epochs):
         epoch_dataset = PregeneratedDataset(epoch=epoch, training_path=args.pregenerated_data, tokenizer=tokenizer,
@@ -310,7 +317,10 @@ def main():
                 nb_tr_steps += 1
                 pbar.update(1)
                 mean_loss = tr_loss * args.gradient_accumulation_steps / nb_tr_steps
+
                 pbar.set_postfix_str(f"Loss: {mean_loss:.5f}")
+                writer.add_scalar('loss_train_batch/loss_train_batch', mean_loss, global_batch_counter_train)
+                global_batch_counter_train += 1
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     if args.fp16:
                         # modify learning rate with special warm up BERT uses
@@ -323,11 +333,17 @@ def main():
                     optimizer.zero_grad()
                     global_step += 1
 
-    # Save a trained model
-    logging.info("** ** * Saving fine-tuned model ** ** * ")
-    model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-    output_model_file = args.output_dir / "pytorch_model.bin"
-    torch.save(model_to_save.state_dict(), str(output_model_file))
+                if args.DEBUG and step == 3:
+                    break
+
+        # Save a trained model
+        logging.info("** ** * Saving fine-tuned model ** ** * ")
+        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+        output_model_file = args.output_dir / ("pytorch_model_%d.bin"%epoch)
+        torch.save(model_to_save.state_dict(), str(output_model_file))
+
+        if args.DEBUG:
+            break
 
 
 if __name__ == '__main__':

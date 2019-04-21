@@ -5,22 +5,17 @@ Created on Sun Apr 14 17:11:55 2019
 @author: msq96
 """
 
+
 import pickle
-import numpy as np
 from tqdm import tqdm
 
 import torch
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tensorboardX import SummaryWriter
+from pytorch_pretrained_bert.modeling import BertForSequenceClassification
+from pytorch_pretrained_bert.optimization import BertAdam
 
+from utils import train, test, save_model_optimizer, load_model_optimizer, try_mkdir
 
-from utils import save_model_optimizer, load_model_optimizer, try_mkdir
-
-from pytorch_pretrained_bert.modeling import BertForSequenceClassification, BertConfig
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
-
-from utils import train, test
 
 DEBUG = False
 EPOCH = 1
