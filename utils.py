@@ -7,97 +7,25 @@ Created on Sun Apr 14 17:14:40 2019
 
 
 import os
+import time
 import pandas as pd
 import torch
 import pickle
 import numpy as np
 from tqdm import tqdm
-from nltk import word_tokenize
+from nltk import word_tokenize, sent_tokenize
 from joblib import Parallel, delayed
+import multiprocessing as mp
+from itertools import repeat
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+
+from pytorch_pretrained_bert import BertTokenizer, BertForSequenceClassification
 
 
-def build_embed_files(fname='./data/embeddings/wiki-news-300d-1M-subword.vec'):
-    vocab_size = 300000
-    embed_dim = 300
-
-    embed_matrix = torch.zeros((vocab_size, embed_dim), dtype=torch.float32)
-    word2idx = {}
-    idx2word = {}
-
-    idx2word[0] = 'zero_pad'
-    word2idx['zero_pad'] = 0
-
-    idx2word[1] = 'septor'
-    word2idx['septor'] = 1
-
-
-    fin = open(fname, 'r', encoding='utf-8', newline='\n', errors='ignore')
-    n, d = map(int, fin.readline().split())
-
-    for idx in tqdm(range(2, vocab_size)):
-        line = fin.readline()
-        tokens = line.rstrip().split(' ')
-        word = tokens[0]
-        embed = torch.FloatTensor(list(map(float, tokens[1:])))
-
-        embed_matrix[idx] = embed
-        word2idx[word] = idx
-        idx2word[idx] = word
-
-    pickle.dump(idx2word, open('./data/embeddings/idx2word.pk', 'wb'))
-    pickle.dump(word2idx, open('./data/embeddings/word2idx.pk', 'wb'))
-    pickle.dump(embed_matrix, open('./data/embeddings/embed_matrix.pk', 'wb'))
-
-
-def pad_seq(seq, max_seq, pad_word='zero_pad'):
-    seq_len = len(seq)
-    if seq_len >= max_seq:
-        return seq[: max_seq]
-    else:
-        num_pad = max_seq - seq_len
-        return seq + [pad_word]*num_pad
-
-
-def build_data(dir='./data/datasets/amazon_review_full_csv/', filename='train.csv',
-               max_seq=200, max_seq_percentile=95, sep=' septor ', pad='zero_pad'):
-    print('Loading data...')
-    data = pd.read_csv(dir+filename, header=None)
-    data.iloc[:, 1:] = data.iloc[:, 1:].fillna('UNK')
-    data = data.values
-
-    y = torch.LongTensor(data[:, 0].astype(np.int64))
-
-    print('Tokenizing sentences...')
-    if data.shape[1] == 3:
-        data = data[:, [1, 2]]
-        X = Parallel(n_jobs=8)(delayed(word_tokenize)(each[0] + sep + each[1]) for each in tqdm(data))
-        del data
-    elif data.shape[1] == 2:
-        data = data[:, 1]
-        assert data.shape == (data.shape[0],)
-        X = Parallel(n_jobs=8)(delayed(word_tokenize)(each) for each in tqdm(data))
-        del data
-
-
-    print('Turn words to indexes...')
-    word2idx = pickle.load(open('./data/embeddings/word2idx.pk', 'rb'))
-    if max_seq is None:
-        max_seq = int(np.percentile([len(sent) for sent in X], max_seq_percentile))
-
-    X = torch.LongTensor([[word2idx.get(word, word2idx['UNK']) for word in pad_seq(seq, max_seq=max_seq, pad_word=pad)] \
-                           for seq in tqdm(X)])
-
-    print('Saving data...')
-    with open(dir+filename.split('.')[0]+'.pk', 'wb') as fout:
-        pickle.dump([X, y], fout, protocol=4)
-    return X, y, max_seq
-
-
-def save_model_optimizer(model, optimizer, epoch, global_batch_counter_train, global_batch_counter_test, scheduler, dir):
+def save_model_optimizer(model, optimizer, epoch, global_batch_counter_train, global_batch_counter_test, dir):
    state = {
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
 
             'epoch': epoch,
             'global_batch_counter_train': global_batch_counter_train,
@@ -112,7 +40,7 @@ def load_lastest_states(params_dir, params_list):
     lastest_states = torch.load(open(lastest_states_path, 'rb'))
     return lastest_states
 
-def load_model_optimizer(model, optimizer, scheduler, dir):
+def load_model_optimizer(model, optimizer, dir):
     DIR_MODEL = dir + 'models/params/'
     params_list = os.listdir(DIR_MODEL)
     if params_list:
@@ -121,7 +49,6 @@ def load_model_optimizer(model, optimizer, scheduler, dir):
 
         model.load_state_dict(states['model'])
         optimizer.load_state_dict(states['optimizer'])
-        scheduler.load_state_dict(states['scheduler'])
 
         current_epoch = states['epoch'] + 1
         global_batch_counter_train = states['global_batch_counter_train']
@@ -140,11 +67,194 @@ def try_mkdir(path):
     else:
         return False
 
+
+def train(batch, model, loss_fct, optimizer):
+    model.zero_grad()
+
+    input_ids, input_mask, label_ids = tuple(t.cuda() for t in batch)
+
+    logits = model(input_ids=input_ids, token_type_ids=None, attention_mask=input_mask, labels=None)
+    loss = loss_fct(logits, label_ids)
+
+    loss.backward()
+    optimizer.step()
+
+    _, predicted = torch.max(logits.data, 1)
+    correct = (predicted == label_ids).sum().item()
+
+    return loss.item(), correct
+
+def test(batch, model, loss_fct, correct, total):
+
+    input_ids, input_mask, label_ids = tuple(t.cuda() for t in batch)
+
+    logits = model(input_ids=input_ids, token_type_ids=None, attention_mask=input_mask, labels=None)
+    loss = loss_fct(logits, label_ids)
+
+    _, predicted = torch.max(logits.data, 1)
+    correct += (predicted == label_ids).sum().item()
+    total += label_ids.size(0)
+
+    return loss.item(), correct, total
+
+
+class InputFeatures(object):
+
+    def __init__(self, input_ids, input_mask, label_id):
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.label_id = label_id
+
+
+class InputExample(object):
+
+    def __init__(self, token_ids, label):
+        self.token_ids = token_ids
+        self.label = label
+
+
+def concat_list_of_string(x):
+    return ' '.join([each+'.' if each[-1] != '.' else each for each in x])
+
+
+def build_examples(dir='./data/datasets/ag_news_csv/', filename='train.csv'):
+    print('Loading data...')
+    data = pd.read_csv(dir+filename, header=None)
+
+    print('Processing data...')
+    data.iloc[:, 1:] = data.iloc[:, 1:].fillna('UNK')
+    texts = data.iloc[:, 1:].apply(lambda x: concat_list_of_string(x), axis=1)
+    labels = data.iloc[:, 0]
+    del data
+
+    print('Building examples...')
+    examples = [InputExample(text, label) for text, label in zip(texts, labels)]
+    label_list = np.unique(labels)
+    return examples, label_list
+
+
+
+def build_data(dir, tokenizer):
+    print('Loading data...')
+    train_df = pd.read_csv(dir+'train.csv', header=None)
+    test_df = pd.read_csv(dir+'test.csv', header=None)
+    train_df['flag'] = 'train'
+    test_df['flag'] = 'test'
+
+    print('Concatenating dataframes and text...')
+    data = pd.concat([train_df, test_df])
+    data.iloc[:, 1:] = data.iloc[:, 1:].fillna('UNK')
+    texts = data.iloc[:, 1:-1].apply(lambda x: concat_list_of_string(x), axis=1).values
+    labels = data.iloc[:, 0].values
+    label_flags = data['flag'].values
+    del data
+
+    def parallel_process(doc_text):
+        doc_sents = sent_tokenize(doc_text)
+        doc_tokenized_sents = [tokenizer.tokenize(each_sent) for each_sent in doc_sents]
+
+        doc_all_tokens = [word_token for tokenized_sent in doc_tokenized_sents for word_token in tokenized_sent]
+        doc_all_token_ids = tokenizer.convert_tokens_to_ids(doc_all_tokens)
+        return doc_tokenized_sents, doc_all_token_ids
+
+    f_corpus = open(dir + 'corpus.pk', 'wb')
+    f_train = open(dir + 'train.pk', 'wb')
+    f_test = open(dir + 'test.pk', 'wb')
+
+    print('Tokenizing data...')
+    for doc_text, doc_label, label_flag in tqdm(zip(texts, labels, label_flags), total=len(labels)):
+        doc_tokenized_sents, doc_all_token_ids = parallel_process(doc_text)
+
+        pickle.dump(doc_tokenized_sents, f_corpus)
+
+        if label_flag == 'train':
+            pickle.dump(InputExample(doc_all_token_ids, doc_label), f_train)
+
+        elif label_flag == 'test':
+            pickle.dump(InputExample(doc_all_token_ids, doc_label), f_test)
+
+    f_corpus.close()
+    f_train.close()
+    f_test.close()
+
+
+def pickle_load(fp):
+
+    with open(fp, "rb") as f:
+        while 1:
+            try:
+                yield pickle.load(f)
+            except EOFError:
+                break
+
+
+def convert_examples_to_features(dir, fname, max_seq_length, tokenizer):
+
+    examples = pickle_load(dir+fname)
+    all_labels = [example.label for example in examples]
+    total_num = len(all_labels)
+
+    label_list = np.unique(all_labels)
+    label_map = {label : i for i, label in enumerate(label_list)}
+
+    def parallel_process(example):
+        token_ids = example.token_ids
+        if len(token_ids) > max_seq_length - 2:
+            token_ids = token_ids[:(max_seq_length - 2)]
+
+        input_ids = tokenizer.convert_tokens_to_ids(["[CLS]"]) + token_ids + tokenizer.convert_tokens_to_ids(["[SEP]"])
+        input_mask = [1] * len(input_ids)
+
+        padding = [0] * (max_seq_length - len(input_ids))
+        input_ids += padding
+        input_mask += padding
+
+        label_id = label_map[example.label]
+
+        return InputFeatures(input_ids=input_ids,
+                             input_mask=input_mask,
+                             label_id=label_id)
+
+    examples = pickle_load(dir+fname)
+    features = [parallel_process(example) for example in tqdm(examples, total=total_num)]
+
+    return features
+
+def save_as_data_loader(dir, features, flag, batch_size):
+    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+    all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+    data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
+
+    if flag == 'train':
+        sampler = RandomSampler(data)
+    elif flag == 'test':
+        sampler = SequentialSampler(data)
+
+    label_ids = np.unique(all_label_ids)
+    dataloader = DataLoader(data, sampler=sampler, batch_size=batch_size)
+
+    pickle.dump([label_ids, dataloader], open(dir + '%s_loader.pk'%flag, 'wb'))
+
+
 if __name__ == '__main__':
-    _, _, max_seq = build_data(dir='./data/datasets/amazon_review_full_csv/', filename='train.csv',
-                               max_seq=None, max_seq_percentile=95, sep=' septor ', pad='zero_pad')
-    build_data(dir='./data/datasets/amazon_review_full_csv/', filename='test.csv',
-               max_seq=max_seq, sep=' septor ', pad='zero_pad')
+
+    dir = './data/datasets/ag_news_csv/'
+    model_name = 'bert-base-uncased'
+
+    max_seq_length_train = 64
+    max_seq_length_test = 128
+
+    batch_size_train = 32
+    batch_size_test = 64
+
+    tokenizer = BertTokenizer.from_pretrained(model_name)
 
 
+    build_data(dir, tokenizer)
 
+    train_features = convert_examples_to_features(dir=dir, fname='train.pk', max_seq_length=max_seq_length_train, tokenizer=tokenizer)
+    test_features = convert_examples_to_features(dir=dir, fname='test.pk', max_seq_length=max_seq_length_test, tokenizer=tokenizer)
+
+    save_as_data_loader(dir, train_features, flag='train', batch_size=batch_size_train)
+    save_as_data_loader(dir, test_features, flag='test', batch_size=batch_size_test)
