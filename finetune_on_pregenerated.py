@@ -333,14 +333,17 @@ def main():
                     optimizer.zero_grad()
                     global_step += 1
 
+
+
+                if int(step + 1) % int(len(train_dataloader)//3) == 0 or (args.DEBUG and step == 3):
+                    # Save a trained model
+                    logging.info("** ** * Saving fine-tuned model ** ** * ")
+                    model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+                    output_model_file = args.output_dir / ("pytorch_model_%d_%d.bin"%(epoch, step))
+                    torch.save(model_to_save.state_dict(), str(output_model_file))
+
                 if args.DEBUG and step == 3:
                     break
-
-        # Save a trained model
-        logging.info("** ** * Saving fine-tuned model ** ** * ")
-        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-        output_model_file = args.output_dir / ("pytorch_model_%d.bin"%epoch)
-        torch.save(model_to_save.state_dict(), str(output_model_file))
 
         if args.DEBUG:
             break

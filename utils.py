@@ -14,9 +14,19 @@ import pickle
 import numpy as np
 from tqdm import tqdm
 from nltk import sent_tokenize
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 
+
 from pytorch_pretrained_bert import BertTokenizer
+
+
+def normalized_entropy(p):
+    m = len(p)
+    v = 0
+    for each in p:
+        v += each * np.log2(each)
+    return 1 - (-1/(np.log2(m)) * v)
 
 
 def save_model_optimizer(model, optimizer, epoch, global_batch_counter_train, global_batch_counter_test, dir):
@@ -92,7 +102,7 @@ def test(batch, model, loss_fct, correct, total):
     correct += (predicted == label_ids).sum().item()
     total += label_ids.size(0)
 
-    return loss.item(), correct, total
+    return loss.item(), correct, total, predicted.cpu().data.numpy().tolist(), label_ids.cpu().data.numpy().tolist(), logits.cpu().data.numpy().tolist()
 
 
 class InputFeatures(object):
@@ -151,7 +161,7 @@ def build_data(dir, tokenizer):
         doc_tokenized_sents = [tokenizer.tokenize(each_sent) for each_sent in doc_sents]
 
         doc_all_tokens = [word_token for tokenized_sent in doc_tokenized_sents for word_token in tokenized_sent]
-        doc_all_token_ids = tokenizer.convert_tokens_to_ids(doc_all_tokens)
+        doc_all_token_ids = tokenizer.convert_tokens_to_ids(doc_all_tokens, allow_longer=True)
         return doc_tokenized_sents, doc_all_token_ids
 
     f_corpus = open(dir + 'corpus.pk', 'wb')
@@ -215,9 +225,32 @@ def convert_examples_to_features(dir, fname, max_seq_length, tokenizer):
     examples = pickle_load(dir+fname)
     features = [parallel_process(example) for example in tqdm(examples, total=total_num)]
 
+    with open(dir+fname.split('.')[0]+'_features.pk', 'wb') as fout:
+        pickle.dump(features, fout)
+
     return features
 
-def save_as_data_loader(dir, features, flag, batch_size):
+def save_as_data_loader(dir, flag, batch_size, size_per_class=None):
+    features = np.array(pickle.load(open(dir+flag+'_features.pk', 'rb')))
+
+    if size_per_class is not None:
+        y = np.array([feature.label_id for feature in features])
+        unique_labels = np.unique(y)
+
+        all_idx = []
+        for each_label in unique_labels:
+            indexes = np.random.choice(np.argwhere(y==each_label).reshape(-1), size_per_class).tolist()
+            all_idx.extend(indexes)
+
+        np.random.shuffle(all_idx)
+
+        features = features[all_idx]
+
+        _, counts = np.unique([feature.label_id for feature in features], return_counts=True)
+
+        assert np.all(counts==size_per_class)
+
+
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
     all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
     all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
@@ -236,22 +269,23 @@ def save_as_data_loader(dir, features, flag, batch_size):
 
 if __name__ == '__main__':
 
-    dir = './data/datasets/ag_news_csv/'
+    dir = './data/datasets/yelp_review_polarity_csv/'
     model_name = 'bert-base-uncased'
 
     max_seq_length_train = 64
-    max_seq_length_test = 128
+    max_seq_length_test = 256
 
-    batch_size_train = 32
-    batch_size_test = 64
+    batch_size_train = 24
+    batch_size_test = 32
+
+    size_per_class_train = 20
+    size_per_class_test = 1000
 
     tokenizer = BertTokenizer.from_pretrained(model_name)
 
+#    build_data(dir, tokenizer)
+#    train_features = convert_examples_to_features(dir=dir, fname='train.pk', max_seq_length=max_seq_length_train, tokenizer=tokenizer)
+#    test_features = convert_examples_to_features(dir=dir, fname='test.pk', max_seq_length=max_seq_length_test, tokenizer=tokenizer)
 
-    build_data(dir, tokenizer)
-
-    train_features = convert_examples_to_features(dir=dir, fname='train.pk', max_seq_length=max_seq_length_train, tokenizer=tokenizer)
-    test_features = convert_examples_to_features(dir=dir, fname='test.pk', max_seq_length=max_seq_length_test, tokenizer=tokenizer)
-
-    save_as_data_loader(dir, train_features, flag='train', batch_size=batch_size_train)
-    save_as_data_loader(dir, test_features, flag='test', batch_size=batch_size_test)
+    save_as_data_loader(dir , flag='train', batch_size=batch_size_train, size_per_class=size_per_class_train)
+    save_as_data_loader(dir, flag='test', batch_size=batch_size_test, size_per_class=size_per_class_test)
