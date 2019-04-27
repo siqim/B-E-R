@@ -17,8 +17,27 @@ from nltk import sent_tokenize
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 
-
 from pytorch_pretrained_bert import BertTokenizer
+
+
+def get_topk(logits, topk, y_pred, test_set):
+    probs = torch.softmax(torch.FloatTensor(logits), dim=1)
+    y_pred = np.array(y_pred)
+    num_classes = probs.shape[1]
+    set_len = len(test_set)
+
+    pool = []
+    for i in range(num_classes):
+        k = np.argsort(-probs[:,i])[: min(topk, set_len//num_classes)]
+        pool.extend(k.tolist())
+
+    pool = list(set(pool))
+
+    all_input_ids, all_input_mask, _ = test_set[pool]
+    all_label_ids = torch.LongTensor(y_pred[pool])
+    print('Acc,', (_==all_label_ids).sum().item() / all_label_ids.shape[0])
+    data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
+    return data
 
 
 def normalized_entropy(p):
@@ -27,82 +46,6 @@ def normalized_entropy(p):
     for each in p:
         v += each * np.log2(each)
     return 1 - (-1/(np.log2(m)) * v)
-
-
-def save_model_optimizer(model, optimizer, epoch, global_batch_counter_train, global_batch_counter_test, dir):
-   state = {
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-
-            'epoch': epoch,
-            'global_batch_counter_train': global_batch_counter_train,
-            'global_batch_counter_test': global_batch_counter_test
-            }
-
-   torch.save(state, open(dir+'models/params/MODEL_%d.tar'%global_batch_counter_train, 'wb'))
-
-def load_lastest_states(params_dir, params_list):
-    lastest_states_idx = np.argmax([int(each_params.split('_')[1][:-4]) for each_params in params_list])
-    lastest_states_path = params_dir + params_list[lastest_states_idx]
-    lastest_states = torch.load(open(lastest_states_path, 'rb'))
-    return lastest_states
-
-def load_model_optimizer(model, optimizer, dir):
-    DIR_MODEL = dir + 'models/params/'
-    params_list = os.listdir(DIR_MODEL)
-    if params_list:
-        print('Loading lastest checkpoint...')
-        states = load_lastest_states(DIR_MODEL, params_list)
-
-        model.load_state_dict(states['model'])
-        optimizer.load_state_dict(states['optimizer'])
-
-        current_epoch = states['epoch'] + 1
-        global_batch_counter_train = states['global_batch_counter_train']
-        global_batch_counter_test = states['global_batch_counter_test']
-
-        return model, optimizer, current_epoch, global_batch_counter_train, global_batch_counter_test
-
-    else:
-        return model, optimizer, 0, 0, 0
-
-
-def try_mkdir(path):
-    if not os.path.isdir(path):
-        os.mkdir(path)
-        return True
-    else:
-        return False
-
-
-def train(batch, model, loss_fct, optimizer):
-    model.zero_grad()
-
-    input_ids, input_mask, label_ids = tuple(t.cuda() for t in batch)
-
-    logits = model(input_ids=input_ids, token_type_ids=None, attention_mask=input_mask, labels=None)
-    loss = loss_fct(logits, label_ids)
-
-    loss.backward()
-    optimizer.step()
-
-    _, predicted = torch.max(logits.data, 1)
-    correct = (predicted == label_ids).sum().item()
-
-    return loss.item(), correct
-
-def test(batch, model, loss_fct, correct, total):
-
-    input_ids, input_mask, label_ids = tuple(t.cuda() for t in batch)
-
-    logits = model(input_ids=input_ids, token_type_ids=None, attention_mask=input_mask, labels=None)
-    loss = loss_fct(logits, label_ids)
-
-    _, predicted = torch.max(logits.data, 1)
-    correct += (predicted == label_ids).sum().item()
-    total += label_ids.size(0)
-
-    return loss.item(), correct, total, predicted.cpu().data.numpy().tolist(), label_ids.cpu().data.numpy().tolist(), logits.cpu().data.numpy().tolist()
 
 
 class InputFeatures(object):
@@ -230,7 +173,7 @@ def convert_examples_to_features(dir, fname, max_seq_length, tokenizer):
 
     return features
 
-def save_as_data_loader(dir, flag, batch_size, size_per_class=None):
+def save_as_data_loader(dir, flag, size_per_class=None):
     features = np.array(pickle.load(open(dir+flag+'_features.pk', 'rb')))
 
     if size_per_class is not None:
@@ -243,28 +186,33 @@ def save_as_data_loader(dir, flag, batch_size, size_per_class=None):
             all_idx.extend(indexes)
 
         np.random.shuffle(all_idx)
-
-        features = features[all_idx]
-
-        _, counts = np.unique([feature.label_id for feature in features], return_counts=True)
-
+        used_features = features[all_idx]
+        _, counts = np.unique([feature.label_id for feature in used_features], return_counts=True)
         assert np.all(counts==size_per_class)
 
+        if flag == 'train':
+            unused_idx = list(set(np.arange(0, y.shape[0])) - set(all_idx))
+            unused_features = features[unused_idx]
+            assert unused_features.shape[0] == (y.shape[0] - size_per_class * unique_labels.shape[0])
 
-    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
-    all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+            unused_input_ids = torch.tensor([f.input_ids for f in unused_features], dtype=torch.long)
+            unused_input_mask = torch.tensor([f.input_mask for f in unused_features], dtype=torch.long)
+            unused_label_ids = torch.tensor([f.label_id for f in unused_features], dtype=torch.long)
+            unused_data = TensorDataset(unused_input_ids, unused_input_mask, unused_label_ids)
+
+            pickle.dump([None, unused_data], open(dir + '%s_set_unused.pk'%flag, 'wb'))
+    else:
+        used_features = features
+
+
+    all_input_ids = torch.tensor([f.input_ids for f in used_features], dtype=torch.long)
+    all_input_mask = torch.tensor([f.input_mask for f in used_features], dtype=torch.long)
+    all_label_ids = torch.tensor([f.label_id for f in used_features], dtype=torch.long)
     data = TensorDataset(all_input_ids, all_input_mask, all_label_ids)
 
-    if flag == 'train':
-        sampler = RandomSampler(data)
-    elif flag == 'test':
-        sampler = SequentialSampler(data)
-
     label_ids = np.unique(all_label_ids)
-    dataloader = DataLoader(data, sampler=sampler, batch_size=batch_size)
 
-    pickle.dump([label_ids, dataloader], open(dir + '%s_loader.pk'%flag, 'wb'))
+    pickle.dump([label_ids, data], open(dir + '%s_set.pk'%flag, 'wb'))
 
 
 if __name__ == '__main__':
@@ -272,14 +220,11 @@ if __name__ == '__main__':
     dir = './data/datasets/yelp_review_polarity_csv/'
     model_name = 'bert-base-uncased'
 
-    max_seq_length_train = 64
+    max_seq_length_train = 256
     max_seq_length_test = 256
 
-    batch_size_train = 24
-    batch_size_test = 32
-
     size_per_class_train = 20
-    size_per_class_test = 1000
+    size_per_class_test = None
 
     tokenizer = BertTokenizer.from_pretrained(model_name)
 
@@ -287,5 +232,5 @@ if __name__ == '__main__':
 #    train_features = convert_examples_to_features(dir=dir, fname='train.pk', max_seq_length=max_seq_length_train, tokenizer=tokenizer)
 #    test_features = convert_examples_to_features(dir=dir, fname='test.pk', max_seq_length=max_seq_length_test, tokenizer=tokenizer)
 
-    save_as_data_loader(dir , flag='train', batch_size=batch_size_train, size_per_class=size_per_class_train)
-    save_as_data_loader(dir, flag='test', batch_size=batch_size_test, size_per_class=size_per_class_test)
+    save_as_data_loader(dir , flag='train', size_per_class=size_per_class_train)
+    save_as_data_loader(dir, flag='test', size_per_class=size_per_class_test)
